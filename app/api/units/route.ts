@@ -22,15 +22,18 @@ export async function GET(request: NextRequest) {
     const unitsSnapshot = await getDocs(unitsQuery);
     
     // Sort manually by unit_number
-    const units = unitsSnapshot.docs.map(doc => {
-      const data = doc.data();
-      return {
-        unit_number: data.unit_number.toString(),
-        unit_title: data.unit_title,
-        _sort_key: data.unit_number || 0
-      };
-    }).sort((a, b) => a._sort_key - b._sort_key)
-    .map(({ _sort_key, ...unit }) => unit); // Remove sort key from final result
+    const units = unitsSnapshot.docs
+      .map(doc => {
+        const data = doc.data();
+        return {
+          unit_number: data.unit_number.toString(),
+          unit_title: data.unit_title,
+          sortKey: data.unit_number || 0
+        };
+      })
+      .sort((a, b) => a.sortKey - b.sortKey)
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars
+      .map(({ sortKey, ...unit }) => unit); // Remove sort key from final result
 
     return NextResponse.json({ units });
 
@@ -73,48 +76,110 @@ async function getUnitWithContent(unitNumber: number) {
       data: doc.data()
     })).sort((a, b) => (a.data.topic_order || 0) - (b.data.topic_order || 0));
 
-    const topics = [];
+    // Extract all topic IDs for batch querying
+    const topicIds = topicsArray.map(topic => topic.id);
 
-    for (const topicDoc of topicsArray) {
-      const topicData = topicDoc.data;
-      const topicId = topicDoc.id;
-      
-      // Get all content for this topic
-      const [videosSnapshot, notesSnapshot, questionsSnapshot] = await Promise.all([
-        getDocs(query(
-          collection(db, 'videos'), 
-          where('topic_id', '==', topicId)
-        )),
-        getDocs(query(
-          collection(db, 'notes'), 
-          where('topic_id', '==', topicId)
-        )),
-        getDocs(query(
-          collection(db, 'questions'), 
-          where('topic_id', '==', topicId)
-        ))
-      ]);
+    // If no topics, return empty
+    if (topicIds.length === 0) {
+      return {
+        unit_number: unitData.unit_number,
+        unit_title: unitData.unit_title,
+        topics: []
+      };
+    }
 
-      // Format content arrays and sort manually
-      const videos = videosSnapshot.docs.map(doc => ({
-        id: doc.id,
-        title: doc.data().title,
-        description: doc.data().description,
-        video_url: doc.data().video_url,
-        duration: doc.data().duration,
-        order_index: doc.data().order_index || 0
-      })).sort((a, b) => a.order_index - b.order_index);
+    // Batch fetch all content for all topics in parallel using 'in' operator
+    // Firestore 'in' queries support up to 10 values, so we need to batch if more than 10 topics
+    const batchSize = 10;
+    const topicIdBatches: string[][] = [];
+    for (let i = 0; i < topicIds.length; i += batchSize) {
+      topicIdBatches.push(topicIds.slice(i, i + batchSize));
+    }
 
-      const notes = notesSnapshot.docs.map(doc => ({
-        id: doc.id,
-        title: doc.data().title,
-        content: doc.data().content,
-        note_type: doc.data().note_type
-      }));
+    // Fetch content for all batches in parallel
+    const contentPromises = topicIdBatches.flatMap(batch => [
+      getDocs(query(collection(db, 'videos'), where('topic_id', 'in', batch))),
+      getDocs(query(collection(db, 'notes'), where('topic_id', 'in', batch))),
+      getDocs(query(collection(db, 'questions'), where('topic_id', 'in', batch)))
+    ]);
 
-      const questions = questionsSnapshot.docs.map(doc => {
+    const contentSnapshots = await Promise.all(contentPromises);
+
+    // Define types for content items
+    type VideoContent = {
+      id: string;
+      title: string;
+      description: string;
+      video_url: string;
+      duration: number;
+      order_index: number;
+    };
+
+    type NoteContent = {
+      id: string;
+      title: string;
+      content: string;
+      note_type: string;
+    };
+
+    type QuestionContent = {
+      id: string;
+      question_text: string;
+      question_type: string;
+      difficulty_level: string;
+      options: { text: string; is_correct: boolean }[] | null;
+      correct_answer: string;
+      explanation: string;
+    };
+
+    // Group content by topic_id for efficient lookup
+    const videosByTopic = new Map<string, VideoContent[]>();
+    const notesByTopic = new Map<string, NoteContent[]>();
+    const questionsByTopic = new Map<string, QuestionContent[]>();
+
+    // Process snapshots in groups of 3 (videos, notes, questions for each batch)
+    for (let i = 0; i < contentSnapshots.length; i += 3) {
+      const videosSnapshot = contentSnapshots[i];
+      const notesSnapshot = contentSnapshots[i + 1];
+      const questionsSnapshot = contentSnapshots[i + 2];
+
+      videosSnapshot.docs.forEach(doc => {
         const data = doc.data();
-        return {
+        const topicId = data.topic_id;
+        if (!videosByTopic.has(topicId)) {
+          videosByTopic.set(topicId, []);
+        }
+        videosByTopic.get(topicId)!.push({
+          id: doc.id,
+          title: data.title,
+          description: data.description,
+          video_url: data.video_url,
+          duration: data.duration,
+          order_index: data.order_index || 0
+        });
+      });
+
+      notesSnapshot.docs.forEach(doc => {
+        const data = doc.data();
+        const topicId = data.topic_id;
+        if (!notesByTopic.has(topicId)) {
+          notesByTopic.set(topicId, []);
+        }
+        notesByTopic.get(topicId)!.push({
+          id: doc.id,
+          title: data.title,
+          content: data.content,
+          note_type: data.note_type
+        });
+      });
+
+      questionsSnapshot.docs.forEach(doc => {
+        const data = doc.data();
+        const topicId = data.topic_id;
+        if (!questionsByTopic.has(topicId)) {
+          questionsByTopic.set(topicId, []);
+        }
+        questionsByTopic.get(topicId)!.push({
           id: doc.id,
           question_text: data.question_text,
           question_type: data.question_type,
@@ -122,19 +187,30 @@ async function getUnitWithContent(unitNumber: number) {
           options: data.options || null,
           correct_answer: data.correct_answer,
           explanation: data.explanation
-        };
+        });
       });
+    }
 
-      // Build topic object in your requested format
+    // Build topics array with content
+    const topics = topicsArray.map(topicDoc => {
+      const topicData = topicDoc.data;
+      const topicId = topicDoc.id;
+
+      // Get content for this topic and sort videos by order_index
+      const videos = (videosByTopic.get(topicId) || []).sort((a, b) => a.order_index - b.order_index);
+      const notes = notesByTopic.get(topicId) || [];
+      const questions = questionsByTopic.get(topicId) || [];
+
+      // Build topic object in requested format
       const topicContent = `${topicData.topic_title}`;
       
-      topics.push({
+      return {
         topic_content: topicContent,
         questions: questions,
         notes: notes,
         videos: videos
-      });
-    }
+      };
+    });
 
     return {
       unit_number: unitData.unit_number,
